@@ -146,6 +146,10 @@ def optimize():
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 422
 
+        # Hard clamp: guarantee the overlay never exceeds the heatmap boundaries.
+        opt_x = max(0, min(opt_x, heatmap_w - ov_w))
+        opt_y = max(0, min(opt_y, heatmap_h - ov_h))
+
         results.append(
             {
                 "id": overlay_id,

@@ -109,8 +109,9 @@ def find_optimal_position(
     flat_idx = np.argmin(heat_map)
     local_y, local_x = np.unravel_index(flat_idx, heat_map.shape)
 
-    best_x = int(local_x + c0)
-    best_y = int(local_y + r0)
+    # Clamp to ensure the overlay never exceeds image boundaries.
+    best_x = int(np.clip(local_x + c0, 0, map_w - overlay_width))
+    best_y = int(np.clip(local_y + r0, 0, map_h - overlay_height))
     heat_sum = float(heat_map[local_y, local_x])
 
     return best_x, best_y, heat_sum

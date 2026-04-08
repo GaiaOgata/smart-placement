@@ -1,23 +1,23 @@
 """
 placement.py — Finds the optimal (lowest heat) position for a rectangular overlay
-               on an intensity map using FFT-based convolution.
+               on an intensity map using a quadrant-based strategy.
 
-Algorithm (O(H·W·log(H·W)) per overlay):
-  1. Build a kernel of ones with the same shape as the overlay (oh × ow).
-  2. Compute cost_map = fftconvolve(intensity, kernel, mode='valid').
-     Each cell (r, c) of cost_map equals the sum of intensity values under the
-     overlay if its top-left corner is placed at (c, r).
-  3. Optionally add a distance penalty: positions far from the original (origin_x,
-     origin_y) are penalised proportionally. Both heat and distance maps are
-     normalised to [0, 1] before being combined via distance_weight ∈ [0, 1].
-       total_cost = (1 - w) * norm_heat + w * norm_dist
-     w=0 → pure heat optimisation (original behaviour).
-     w=1 → stay as close to the origin as possible, ignoring heat.
-  4. The optimal position is the argmin of total_cost.
+Algorithm:
+  1. Divide the intensity map into 4 equal quadrants (top-left, top-right,
+     bottom-left, bottom-right).
+  2. Compute the total heat sum of each quadrant and select the one with the
+     lowest sum.
+  3. Within the selected quadrant, use FFT convolution to build a cost map
+     where each cell equals the sum of intensity values under the overlay when
+     its top-left corner is placed at that position.
+  4. The optimal position is the argmin of that cost map, converted back to
+     global image coordinates.
 
-Edge case:
+Edge cases:
   - If the overlay is larger than the heatmap in either dimension a ValueError
     is raised (the caller should convert this to an HTTP 422).
+  - If the overlay is larger than the selected quadrant in either dimension a
+    ValueError is raised.
 """
 
 from __future__ import annotations
@@ -36,6 +36,10 @@ def find_optimal_position(
 ) -> tuple[int, int, float]:
     """Return the top-left (x, y) and heat sum for the optimal overlay position.
 
+    The heatmap is divided into 4 equal quadrants.  The quadrant with the
+    lowest total heat is selected, and within it the position that minimises
+    the heat sum under the overlay is returned.
+
     Parameters
     ----------
     intensity:
@@ -45,14 +49,9 @@ def find_optimal_position(
     overlay_height:
         Height of the overlay in pixels.
     origin_x, origin_y:
-        Top-left coordinates of the overlay's original position.  Used as the
-        reference point for the distance penalty.  Ignored when distance_weight=0.
+        Kept for API compatibility; not used in this algorithm.
     distance_weight:
-        Float in [0.0, 1.0] controlling the trade-off between heat avoidance and
-        proximity to the original position.
-          0.0 → optimise heat only (default, original behaviour).
-          1.0 → stay as close to origin as possible, ignoring heat.
-        Both cost components are normalised to [0, 1] before combining.
+        Kept for API compatibility; not used in this algorithm.
 
     Returns
     -------
@@ -63,7 +62,7 @@ def find_optimal_position(
     Raises
     ------
     ValueError
-        If the overlay is larger than the intensity map in either dimension.
+        If the overlay is larger than the intensity map or the selected quadrant.
     """
     map_h, map_w = intensity.shape
 
@@ -73,44 +72,48 @@ def find_optimal_position(
             f"heatmap ({map_w}×{map_h})."
         )
 
-    # Kernel: rectangle of ones matching the overlay size
-    kernel = np.ones((overlay_height, overlay_width), dtype=np.float32)
+    # --- Step 1: divide the map into 4 equal quadrants ---
+    mid_h = map_h // 2
+    mid_w = map_w // 2
 
-    # FFT convolution — mode='valid' gives shape (map_h - oh + 1, map_w - ow + 1)
-    # Clip small negative values produced by floating-point noise in FFT.
-    heat_map = np.clip(fftconvolve(intensity, kernel, mode="valid"), 0.0, None)
+    # Each entry: (row_start, col_start, row_end, col_end)
+    quadrants = [
+        (0,     0,     mid_h,  mid_w),   # top-left
+        (0,     mid_w, mid_h,  map_w),   # top-right
+        (mid_h, 0,     map_h,  mid_w),   # bottom-left
+        (mid_h, mid_w, map_h,  map_w),   # bottom-right
+    ]
 
-    if distance_weight > 0.0:
-        rows, cols = heat_map.shape
+    # --- Step 2: pick the quadrant with the lowest total heat ---
+    quad_sums = [
+        float(intensity[r0:r1, c0:c1].sum())
+        for (r0, c0, r1, c1) in quadrants
+    ]
+    best_idx = int(np.argmin(quad_sums))
+    r0, c0, r1, c1 = quadrants[best_idx]
 
-        # Normalise heat to [0, 1]
-        heat_max = heat_map.max()
-        norm_heat = heat_map / heat_max if heat_max > 0.0 else np.zeros_like(heat_map)
+    quad_intensity = intensity[r0:r1, c0:c1]
+    quad_h, quad_w = quad_intensity.shape
 
-        # Build distance map: each cell (r, c) → Euclidean distance to origin
-        r_idx = np.arange(rows, dtype=np.float32)
-        c_idx = np.arange(cols, dtype=np.float32)
-        dist_map = np.sqrt(
-            (c_idx[None, :] - origin_x) ** 2 + (r_idx[:, None] - origin_y) ** 2
+    if overlay_height > quad_h or overlay_width > quad_w:
+        raise ValueError(
+            f"Overlay ({overlay_width}×{overlay_height}) is larger than the "
+            f"selected quadrant ({quad_w}×{quad_h})."
         )
 
-        # Normalise distance to [0, 1]
-        dist_max = dist_map.max()
-        norm_dist = dist_map / dist_max if dist_max > 0.0 else np.zeros_like(dist_map)
+    # --- Step 3: find the best position inside the quadrant via FFT convolution ---
+    kernel = np.ones((overlay_height, overlay_width), dtype=np.float32)
+    heat_map = np.clip(fftconvolve(quad_intensity, kernel, mode="valid"), 0.0, None)
 
-        # Weighted combination
-        total_cost = (1.0 - distance_weight) * norm_heat + distance_weight * norm_dist
-    else:
-        total_cost = heat_map
+    # --- Step 4: argmin → global coordinates ---
+    flat_idx = np.argmin(heat_map)
+    local_y, local_x = np.unravel_index(flat_idx, heat_map.shape)
 
-    # Find position with minimum total cost
-    flat_idx = np.argmin(total_cost)
-    min_y, min_x = np.unravel_index(flat_idx, total_cost.shape)
+    best_x = int(local_x + c0)
+    best_y = int(local_y + r0)
+    heat_sum = float(heat_map[local_y, local_x])
 
-    # Report the raw heat sum at the chosen position (not the combined cost)
-    heat_sum = float(heat_map[min_y, min_x])
-
-    return int(min_x), int(min_y), heat_sum
+    return best_x, best_y, heat_sum
 
 
 def compute_heat_sum_at(
